@@ -1,0 +1,315 @@
+	
+#CONDIOTNAL DATA AUTOMATE TWO YEARS
+	
+
+	SELECT 
+	member_id,
+	diagnosis_key,
+	from "hk_i_cleansed_ghb"."claims" 
+	where market in ('Singapore','Hong Kong') 
+	and incurred__date__year_month_ >=(select
+	                                MAX(incurred__date__year_month_)-INTERVAL '2' year
+	                                from "hk_i_cleansed_ghb"."claims" )  
+	group by member_id,diagnosis_key
+	;
+	
+
+
+## create View 
+
+CREATE  VIEW "analysistemp_clinical"."diamond_ccsr_2023" AS
+select
+im_diamond_claimsmember.__index_level_0__,
+im_diamond_claimsmember.icd_10_cm_code,
+icd_ccsr_2023_temp.ICD_code_2023,
+im_diamond_claimsmember.unique_member_id_key,
+im_diamond_claimsmember.case_type_nm,
+im_diamond_claimsmember.eligible_yr,
+im_diamond_claimsmember.book_of_business_nm,
+im_diamond_claimsmember.local_currency_net_amt,
+icd_ccsr_2023_temp.ICD_10_CM_CODE_DESCRIPTION_2023,
+chapter_ccsr_2023_temp.CODE_range_first_three_characters,
+chapter_ccsr_2023_temp.CCSR_Body_System_Abbreviation_2023,
+chapter_ccsr_2023_temp.ICD_10_code_book_chapter_2023
+from "intl-euro-da-feature-stores"."im_diamond_claimsmember" 
+left join
+"analysistemp_clinical"."icd_ccsr_2023_temp" 
+on 
+im_diamond_claimsmember.icd_10_cm_code = icd_ccsr_2023_temp.ICD_code_2023
+left join 
+"analysistemp_clinical"."chapter_ccsr_2023_temp"
+on 
+SUBSTRING(icd_ccsr_2023_temp.ICD_code_2023,1,3)= chapter_ccsr_2023_temp.CODE_range_first_three_characters
+where im_diamond_claimsmember.eligible_yr = '2022'
+order by im_diamond_claimsmember.icd_10_cm_code desc;
+
+=========================================================================================
+
+
+
+# Create table
+
+
+CREATE EXTERNAL TABLE IF NOT EXISTS  `analysistemp_clinical`.`icd_ccsr_2023_temp`(
+`ICD_code_2023` string,
+`ICD_10_CM_CODE_DESCRIPTION_2023` string,
+`Default_CCSR_CATEGORY_IP_2023` string,
+`Default_CCSR_CATEGORY_DESCRIPTION_IP_2023` string,
+`Default_CCSR_CATEGORY_OP_2023` string,
+`Default_CCSR_CATEGORY_DESCRIPTION_OP_2023` string,
+`CCSR_CATEGORY_1_2023` string,
+`CCSR_CATEGORY_1_DESCRIPTION_2023` string
+)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
+WITH SERDEPROPERTIES (
+'serialization.format' = ',',
+'field.delim' = ','
+)
+LOCATION 's3://intl-euro-uk-datascientist-prod/Abhiya/test_2/'
+TBLPROPERTIES ('skip.header.line.count'='1');
+
+
+
+=================================================================================
+
+# Create CTE with row number for duplicates
+
+With CTE_dup as (Select CCSR_Body_System_Abbreviation_2023,
+ ICD_10_code_book_chapter_2023,
+ ICD_10_CM_CODE_DESCRIPTION_2023,
+ local_currency_net_amt, 
+ unique_member_id_key,
+ case_type_nm,
+ book_of_business_nm,
+ __index_level_0__,
+  row_number() Over (partition by CCSR_Body_System_Abbreviation_2023,__index_level_0__ order by ICD_10_code_book_chapter_2023) as rownumber
+From "analysistemp_clinical"."diamond_ccsr_2023" ) 
+
+
+Select 
+CCSR_Body_System_Abbreviation_2023,
+ICD_10_CM_CODE_DESCRIPTION_2023,
+sum(local_currency_net_amt) as net_amount
+from CTE_dup 
+where rownumber=1 
+And (case_type_nm = NULL OR case_type_nm = 'Medical')
+AND book_of_business_nm = 'Americas'
+group by CCSR_Body_System_Abbreviation_2023,ICD_10_CM_CODE_DESCRIPTION_2023
+order by 3 desc; 
+
+
+
+#Contributors: 
+# Sneha Dhital
+# Tze Y Cheung
+
+#Sagemaker_VewingTables_CreatingPermanentTables_to_Athena_and_S3
+
+#---------Sagemaker
+
+#Notes:
+#https://confluence.sys.cigna.com/display/IMDS/6%29+Useful+code+snippets
+#	• Machine learning platform from Amazon
+#	• Contains data science tools (for predicting, model training, data transformation, wrangling) such as:
+#		○ Preprocessing  workflow/pipeline
+#		○ Training workflows
+#		○ Batch Inference Workflows (if you want to do batch prediction)
+#		○ Endpoint API (if you want to expose your model and accept incoming data)
+#	• When you deploy predictive model (into production), you commit to git
+
+#Instances:
+#Available/viewable to all with access
+#Currently can't create instances/"projects" in Sagemaker
+
+
+#Pick the region on right corner first before opening an instance
+#Asia: Singapore / ap-southeast-1
+#America/Europe/MiddleEast: LONDON / eu-west-2
+#pick kernel: conda_python3
+#Install (if haven't already)
+
+
+!pip install boto3
+!pip install awswrangler
+
+
+import pandas as pd
+import numpy as np
+import boto3
+import awswrangler as wr
+
+
+#connect to region
+#--Singapore/Asia
+#session = boto3.Session(region_name="ap-southeast-1")
+#--London/Europe
+session = boto3.Session(region_name="eu-west-2")
+
+#connect to s3
+client = boto3.client('s3')
+ 
+########## typically used to extract athena table into sagemaker #############
+#extract to view table from athena
+query = """
+SELECT * 
+FROM "intl-euro-diamond-shadow-database"."cieb_rxprime_pct_archive" limit 10
+--FROM "hk_i_cleansed_salesforce"."sfdc_lead" limit 3
+"""
+
+#setting the output of the query to a dataframe df, run this prior to running the df query
+df = wr.athena.read_sql_query(query,\
+#specify where the query runs--this query will run in the "analysttempdb" database in "eu-west-2" region in the overarching s3 database                             
+database="analysttempdb",\
+boto3_session=session,\
+ctas_approach=False,\
+workgroup='DataScientists')
+#view
+df.head(3)
+#can explore the table from athena now as a dataframe:
+df.head()
+ 
+ 
+ 
+ #--------------------------------------------------------------------------------------------------
+ 
+############### typically not used, but done on a case by case basis to send tables from sagemaker to Athena #############
+#Create a permanent table in athena
+#You can check to see that a new table is created in the database analysttempdb
+query = """
+CREATE TABLE IF NOT EXISTS "analysttempdb"."h12523_pharm2021test_temp" as  
+SELECT * 
+FROM "intl-euro-diamond-shadow-database"."cieb_rxprime_pct_archive" 
+limit 1000
+--where "service_date" between TIMESTAMP '2021-01-01' and TIMESTAMP '2021-12-31'
+"""
+#setting the output of the query to a dataframe, connecting
+df = wr.athena.read_sql_query(query,\
+#specify where the query runs--this query will run in the "analysttempdb" database in "ap-southeast-1" region in the overarching s3 database                             
+database="analysttempdb",\
+boto3_session=session,\
+ctas_approach=False,\
+workgroup='DataScientists')
+#dropping a table in athena from sagemaker
+query = """
+drop table analysttempdb.h12523_permanent_table 
+"""
+#setting the output of the query to a dataframe, connecting
+df = wr.athena.read_sql_query(query,\
+#specify where the query runs--this query will run in the "analysttempdb" database in "ap-southeast-1" region in the overarching s3 database                             
+database="analysttempdb",\
+boto3_session=session,\
+ctas_approach=False,\
+workgroup='DataScientists')
+#view
+df.head()
+#extract to view table from athena:
+query = """
+SELECT * FROM "analysttempdb"."h12523_pharm2021test_temp"
+"""
+#setting the output of the query to a dataframe, connecting
+h12523_pharm2021test_temp = wr.athena.read_sql_query(query,\
+#specify where the query runs--this query will run in the "analysttempdb" database in "ap-southeast-1" region in the overarching s3 database                             
+database="analysttempdb",\
+boto3_session=session,\
+ctas_approach=False,\
+workgroup='DataScientists')
+#view
+h12523_pharm2021test_temp.head(3)
+ 
+ 
+########## used sometimes to send tables to S3 from sagemaker #############
+#Sending a dataframe from sagemaker to a S3 folder (ex:Amazon S3-->intl-euro-uk-datascientist-prod-->Sneha-->file)
+wr.s3.to_csv(
+    df= h12523_pharm2021test_temp,
+    path='s3://intl-euro-uk-datascientist-prod/Sneha/pharm2021test.csv')
+#view the s3 folder's CSV table in sagemaker
+h12523_pharm2021test_temp = pd.read_csv("s3://intl-euro-uk-datascientist-prod/Sneha/pharm2021test.csv")
+h12523_pharm2021test_temp.head(3)
+ 
+ 
+############### typically not used, but done on a case by case basis to send tables from S3 to Athena #############
+#upload the S3 CSV table into Athena. Note: You have to list out each column and column type
+query = """
+CREATE EXTERNAL TABLE IF NOT EXISTS `analysttempdb`.`h12523_tablefroms3_temp` (
+`pharmacy_count` int,
+`pharmacy_rej_amount` string
+)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
+WITH SERDEPROPERTIES (
+'serialization.format' = ',',
+'field.delim' = ','
+) LOCATION 's3://intl-euro-uk-datascientist-prod/Sneha'
+TBLPROPERTIES ('has_encrypted_data'='false')
+"""
+#setting the output of the query to a dataframe, connecting
+df = wr.athena.read_sql_query(query,\
+#specify where the query runs--this query will run in the "analysttempdb" database in "ap-southeast-1" region in the overarching s3 database                             
+database="analysttempdb",\
+boto3_session=session,\
+ctas_approach=False,\
+workgroup='DataScientists')
+#extract to view table from athena
+query = """
+SELECT * 
+FROM "analysttempdb"."h12523_tablefroms3_temp" limit 10
+"""
+#setting the output of the query to a dataframe df, run this prior to running the df query
+df = wr.athena.read_sql_query(query,\
+#specify where the query runs--this query will run in the "analysttempdb" database in "eu-west-2" region in the overarching s3 database                             
+database="analysttempdb",\
+boto3_session=session,\
+ctas_approach=False,\
+workgroup='DataScientists')
+#view
+df.head(3)
+
+
+# column name in athena
+
+SELECT *
+FROM   information_schema.columns
+WHERE  table_schema = 'client-reporting-diamond'   ##(db name)
+AND table_name = 'claims';                          
+
+
+# count of rows
+
+select count (*) from "intl-euro-da-feature-stores"."im_diamond_claimsmember";
+
+
+#count of columns
+select
+claim_status_txt,
+count(claim_status_txt)
+from "client-reporting-diamond"."claims"
+group by claim_status_txt
+;
+
+
+# count of missing and not missing
+SELECT 
+SUM(CASE WHEN detail_svc_date is null THEN 1 ELSE 0 END) AS Null_count,
+COUNT(detail_svc_date) AS Not_null
+FROM "client-reporting-diamond"."claims"
+;
+
+
+# distinct_count
+SELECT 
+distinct(eligible_yr) 
+from "intl-euro-da-feature-stores"."im_diamond_claimsmember_healthstateflag";
+
+
+## count year wise (eligibity year columns eg jun 2022)
+SELECT
+eligible_yr,
+count(*) 
+FROM "intl-euro-da-feature-stores"."im_diamond_claimsmember_healthstateflag_monthly"
+where eligible_yr like '%2022'
+group by eligible_yr
+;
+
+
+
+
+
